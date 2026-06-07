@@ -1,0 +1,15 @@
+[project]
+name = "nanomark"
+version = "0.1.0"
+description = "NanoMark: a small, encoder-free OCR decoder (GPT-2-small-shaped)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=5.0.0",
+    "numpy>=2.4.6",
+    "pillow>=12.2.0",
+    "pytest>=9.0.3",
+    "tiktoken>=0.13.0",
+    "torch>=2.12.0",
+    "wandb>=0.27.2",
+]

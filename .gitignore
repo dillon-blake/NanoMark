@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments / uv
+.venv/
+venv/
+# NOTE: .python-version and uv.lock are intentionally tracked (uv reproducibility)
+
+# Test / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Training artifacts
+checkpoints/
+*.pt
+*.bin
+*.ckpt
+
+# Weights & Biases
+wandb/
+
+# Datasets / cached data
+data/
+*.npy
+
+# macOS
+.DS_Store
