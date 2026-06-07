@@ -19,7 +19,6 @@ from dataclasses import asdict, replace
 from functools import partial
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from config import Config
@@ -73,6 +72,13 @@ def to_device(batch, device):
 def forward_loss(model, batch):
     """Run the model and return the label-masked cross-entropy loss.
 
+    Delegates to :meth:`model.NanoMark.loss`, which projects the LM head and the
+    fp32 logits only at positions that carry a label (``labels != -100``) instead
+    of over the whole padded sequence. The result is identical to a full-sequence
+    ``cross_entropy(..., ignore_index=-100)`` but avoids materializing a
+    [B*S, vocab] fp32 logits tensor for the image-patch and padding positions that
+    contribute nothing to the loss.
+
     Args:
         model: The NanoMark model.
         batch: A collated, on-device batch from :func:`data.collate_fn`.
@@ -80,13 +86,8 @@ def forward_loss(model, batch):
     Returns:
         A scalar loss tensor (computed in fp32).
     """
-    logits = model(batch["input_ids"], batch["patches"], batch["image_slots"],
-                   batch["pos_h"], batch["pos_w"], batch["attn_mask"])
-    return F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)).float(),
-        batch["labels"].reshape(-1),
-        ignore_index=-100,
-    )
+    return model.loss(batch["input_ids"], batch["patches"], batch["image_slots"],
+                      batch["pos_h"], batch["pos_w"], batch["attn_mask"], batch["labels"])
 
 
 def set_lr(muon, adamw, cfg, opt_step):

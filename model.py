@@ -270,6 +270,41 @@ class NanoMark(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def trunk(self, input_ids, patches, image_slots, pos_h, pos_w, attn_mask):
+        """Run the transformer trunk and return final-normed hidden states.
+
+        Everything in :meth:`forward` except the tied output projection. Split
+        out so the loss path can project the head on only the positions that
+        contribute to the loss (see :meth:`loss`).
+
+        Args:
+            input_ids: Token ids, shape [B, S]. Image-slot positions hold a
+                placeholder id (overwritten by ``patches``, so its value is
+                ignored).
+            patches: Flattened image patches, shape [B, P, patch_dim], right-
+                padded per sample (P = max patches in the batch).
+            image_slots: Boolean mask, shape [B, S], True at image-patch
+                positions. ``image_slots[b].sum()`` equals sample ``b``'s patch
+                count, so it aligns with ``patches[b]``.
+            pos_h: Row positions for 2D RoPE, shape [B, S].
+            pos_w: Column positions for 2D RoPE, shape [B, S].
+            attn_mask: Boolean attention mask, shape [B, 1, S, S] (True = attend).
+
+        Returns:
+            Final hidden states, shape [B, S, d_model].
+        """
+        h = self.tok_emb(input_ids)                          # [B, S, d]
+        proj = self.patch_norm(self.patch_proj(patches))     # [B, P, d], scale-stabilized
+
+        # splice projected patches into the image slots (per sample; see helper)
+        h = _scatter_patches(h, proj, image_slots)
+
+        cos, sin = build_rope_cache(pos_h, pos_w, self.cfg.head_dim, self.cfg.rope_base)
+        cos, sin = cos.to(h.dtype), sin.to(h.dtype)
+        for block in self.blocks:
+            h = block(h, cos, sin, attn_mask)
+        return self.final_norm(h)
+
     def forward(self, input_ids, patches, image_slots, pos_h, pos_w, attn_mask):
         """Compute next-token logits over the whole sequence.
 
@@ -289,19 +324,35 @@ class NanoMark(nn.Module):
         Returns:
             Logits over the padded vocabulary, shape [B, S, padded_vocab].
         """
-        h = self.tok_emb(input_ids)                          # [B, S, d]
-        proj = self.patch_norm(self.patch_proj(patches))     # [B, P, d], scale-stabilized
+        h = self.trunk(input_ids, patches, image_slots, pos_h, pos_w, attn_mask)
+        return h @ self.tok_emb.weight.T                     # tied head, [B, S, padded_vocab]
 
-        # splice projected patches into the image slots (per sample; see helper)
-        h = _scatter_patches(h, proj, image_slots)
+    def loss(self, input_ids, patches, image_slots, pos_h, pos_w, attn_mask, labels):
+        """Label-masked cross-entropy, projecting the head only where it matters.
 
-        cos, sin = build_rope_cache(pos_h, pos_w, self.cfg.head_dim, self.cfg.rope_base)
-        cos, sin = cos.to(h.dtype), sin.to(h.dtype)
-        for block in self.blocks:
-            h = block(h, cos, sin, attn_mask)
-        h = self.final_norm(h)
-        logits = h @ self.tok_emb.weight.T                   # tied head, [B, S, padded_vocab]
-        return logits
+        Equivalent to ``cross_entropy(forward(...), labels, ignore_index=-100)``
+        but the tied output head and the fp32 logits are computed only at the
+        positions that carry a label (``labels != -100``). The gather flattens
+        across the batch, so image-patch positions and SEQ_PAD padding never
+        produce logits — the [B*S, vocab] fp32 tensor that otherwise dominates
+        memory shrinks to [num_text_tokens, vocab]. The loss and gradients are
+        identical to the full-sequence computation (the dropped rows are exactly
+        the ones ``ignore_index`` would have masked out).
+
+        Args:
+            input_ids/patches/image_slots/pos_h/pos_w/attn_mask: As in
+                :meth:`forward`.
+            labels: Next-token targets, shape [B, S], with -100 at positions
+                excluded from the loss.
+
+        Returns:
+            A scalar cross-entropy loss tensor (computed in fp32).
+        """
+        h = self.trunk(input_ids, patches, image_slots, pos_h, pos_w, attn_mask)
+        keep = labels != -100                                # [B, S], True on text targets
+        h_kept = h[keep]                                     # [N, d], gathered across the batch
+        logits = (h_kept @ self.tok_emb.weight.T).float()    # [N, padded_vocab]
+        return F.cross_entropy(logits, labels[keep])
 
 
 def _scatter_patches(h, proj, image_slots):
