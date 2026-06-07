@@ -350,6 +350,8 @@ class NanoMark(nn.Module):
         """
         h = self.trunk(input_ids, patches, image_slots, pos_h, pos_w, attn_mask)
         keep = labels != -100                                # [B, S], True on text targets
+        if not keep.any():                                   # all-masked batch: empty gather -> CE is NaN
+            return h.sum() * 0.0                             # finite, zero-gradient, keeps the graph valid
         h_kept = h[keep]                                     # [N, d], gathered across the batch
         logits = (h_kept @ self.tok_emb.weight.T).float()    # [N, padded_vocab]
         return F.cross_entropy(logits, labels[keep])

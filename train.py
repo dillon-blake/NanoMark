@@ -132,9 +132,10 @@ def train_step(model, batch, muon, adamw, cfg, step, use_amp):
     muon.zero_grad(set_to_none=True)
     adamw.zero_grad(set_to_none=True)
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-    muon.step()
-    adamw.step()
+    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+    if torch.isfinite(total_norm):  # skip the update on a NaN/Inf grad so it can't poison the weights
+        muon.step()
+        adamw.step()
     return loss.item()
 
 
@@ -269,7 +270,7 @@ def main():
 
     # --- sanity mode: overfit a single batch ---
     if args.overfit_one_batch:
-        ocfg = replace(cfg, max_steps=200)
+        ocfg = replace(cfg, max_steps=200, warmup_steps=max(1, round(cfg.warmup_ratio * 200)))
         batch = to_device(next(iter(train_loader)), device)
         for step in range(ocfg.max_steps):
             loss = train_step(model, batch, muon, adamw, ocfg, step, use_amp)
@@ -280,10 +281,11 @@ def main():
     # --- epoch-based training with gradient accumulation ---
     accum = cfg.grad_accum
     total_steps = max(1, (cfg.epochs * len(train_loader)) // accum)  # optimizer steps
-    cfg = replace(cfg, max_steps=total_steps)  # so the cosine LR schedule spans the full run
+    warmup = max(1, round(cfg.warmup_ratio * total_steps))  # warmup as a fraction of the full run
+    cfg = replace(cfg, max_steps=total_steps, warmup_steps=warmup)  # so the LR schedule spans the run
     os.makedirs(cfg.out_dir, exist_ok=True)
     print(f"epochs={cfg.epochs}  grad_accum={accum}  effective_batch={cfg.batch_size * accum}  "
-          f"opt_steps={total_steps}")
+          f"opt_steps={total_steps}  warmup_steps={warmup}")
 
     def save_ckpt(name, step):
         path = os.path.join(cfg.out_dir, name)
@@ -306,10 +308,13 @@ def main():
                 continue  # keep accumulating
 
             # --- one optimizer step (every `accum` micro-batches) ---
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            muon.step()
-            adamw.step()
-            muon.zero_grad(set_to_none=True)
+            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            if torch.isfinite(total_norm):  # a NaN/Inf grad would clip to NaN and poison every later step
+                muon.step()
+                adamw.step()
+            else:
+                print(f"  skipping step {opt_step}: non-finite grad norm")
+            muon.zero_grad(set_to_none=True)  # drop the (possibly bad) grads either way
             adamw.zero_grad(set_to_none=True)
 
             if opt_step % cfg.log_every == 0:
@@ -330,9 +335,10 @@ def main():
 
     # flush a trailing partial accumulation window, if any
     if micro % accum != 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        muon.step()
-        adamw.step()
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        if torch.isfinite(total_norm):
+            muon.step()
+            adamw.step()
 
     # final eval + checkpoint
     eval_loss = evaluate(model, eval_loader, device, cfg.eval_batches)

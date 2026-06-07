@@ -72,7 +72,8 @@ class Config:
     lr_adamw: float = 3e-4
     weight_decay: float = 0.1
     adam_betas: tuple = (0.9, 0.95)
-    warmup_steps: int = 200
+    warmup_ratio: float = 0.05  # fraction of total optimizer steps spent in LR warmup
+    warmup_steps: int = 0       # resolved at runtime to warmup_ratio * max_steps (see train.main)
     max_steps: int = 10000     # set automatically at runtime from epochs * steps/epoch
     grad_clip: float = 1.0
 
