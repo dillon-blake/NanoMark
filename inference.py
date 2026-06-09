@@ -13,7 +13,8 @@ import torch
 from PIL import Image
 
 from config import Config
-from data import PAD_IMG, REAL_IMG, TEXT, build_attn_mask, get_tokenizer, preprocess_image
+from data import (PAD_IMG, REAL_IMG, TEXT, build_attn_mask, get_tokenizer,
+                  patch_grid_coords, preprocess_image)
 from model import NanoMark
 
 
@@ -30,7 +31,7 @@ def transcribe(model, img, cfg, tokenizer, device, max_new_tokens=256, temperatu
         model: A trained NanoMark in eval mode.
         img: The document image to transcribe.
         cfg: The model configuration.
-        tokenizer: A tiktoken encoding for decoding the output ids.
+        tokenizer: A HuggingFace tokenizer for decoding the output ids.
         device: Device to run on.
         max_new_tokens: Hard cap on generated tokens.
         temperature: 0 for greedy argmax; >0 to sample from the softmax.
@@ -47,19 +48,33 @@ def transcribe(model, img, cfg, tokenizer, device, max_new_tokens=256, temperatu
                   + [REAL_IMG if (r < rr and c < cc) else PAD_IMG
                      for r in range(G) for c in range(G)]
                   + [TEXT])
-    pos_h, pos_w = [0], [0]
-    for r in range(G):
-        for c in range(G):
-            pos_h.append(r + 1)
-            pos_w.append(c + 1)
-    offset = 1 + max(rr, cc)
-    pos_h.append(offset)  # SOC
-    pos_w.append(offset)
+    # grid coords for the learned positional table (analog of build_sample's patch_pos)
+    patch_pos = torch.tensor([patch_grid_coords(G)], device=device)  # [1, P, 2]
 
-    # only BPE tokens and EOS are valid outputs (never BOS/SOC/vocab padding)
-    valid = torch.full((cfg.padded_vocab,), float("-inf"), device=device)
-    valid[: cfg.vocab_size] = 0.0
-    valid[cfg.eos_id] = 0.0
+    # RoPE positions: same scheme as build_sample. "learned" gives image tokens a
+    # plain sequential 1D index; "rope2d" places patches on their (r+1, c+1) grid
+    # and resumes text past the image extent. The per-step append below (pos[-1]+1)
+    # continues either scheme correctly.
+    if cfg.image_pos_mode == "learned":
+        pos_h = list(range(G * G + 2))  # BOS + P patches + SOC, sequential
+        pos_w = list(pos_h)
+    else:
+        pos_h, pos_w = [0], [0]
+        for r in range(G):
+            for c in range(G):
+                pos_h.append(r + 1)
+                pos_w.append(c + 1)
+        offset = 1 + max(rr, cc)
+        pos_h.append(offset)  # SOC
+        pos_w.append(offset)
+
+    # only real tokens and EOS are valid outputs. Unlike GPT-2, the Qwen3 special
+    # tokens live *inside* the vocab range, so forbid BOS/SOC explicitly (and the
+    # unused vocab-padding rows); EOS stays allowed.
+    valid = torch.zeros(cfg.padded_vocab, device=device)
+    valid[cfg.vocab_size:] = float("-inf")
+    valid[cfg.bos_id] = float("-inf")
+    valid[cfg.soc_id] = float("-inf")
 
     generated = []
     for _ in range(max_new_tokens):
@@ -71,6 +86,7 @@ def transcribe(model, img, cfg, tokenizer, device, max_new_tokens=256, temperatu
             torch.tensor([pos_h], device=device),
             torch.tensor([pos_w], device=device),
             build_attn_mask(tt),
+            patch_pos,
         )
         next_logits = logits[0, -1] + valid
         if temperature > 0:
@@ -86,7 +102,7 @@ def transcribe(model, img, cfg, tokenizer, device, max_new_tokens=256, temperatu
         pos_h.append(pos_h[-1] + 1)
         pos_w.append(pos_w[-1] + 1)
 
-    return tokenizer.decode([i for i in generated if i < cfg.vocab_size])
+    return tokenizer.decode(generated, skip_special_tokens=True)
 
 
 def main():
@@ -109,13 +125,15 @@ def main():
         else "cpu"
     )
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    cfg = ckpt["cfg"] if isinstance(ckpt.get("cfg"), Config) else Config()
+    cfg = ckpt.get("cfg")
+    if not isinstance(cfg, Config):
+        raise ValueError("checkpoint has no Config under 'cfg'; cannot rebuild the model shape")
     model = NanoMark(cfg).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
     img = Image.open(args.image)
-    text = transcribe(model, img, cfg, get_tokenizer(), device,
+    text = transcribe(model, img, cfg, get_tokenizer(cfg.base_repo), device,
                       args.max_new_tokens, args.temperature)
     print(text)
 

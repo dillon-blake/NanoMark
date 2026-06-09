@@ -1,14 +1,16 @@
 """The NanoMark model: an encoder-free OCR decoder.
 
-A GPT-2-small-shaped decoder-only transformer with modern components:
+A Qwen3-0.6B-shaped decoder-only transformer with modern components:
     - RMSNorm (``torch.nn.RMSNorm``) instead of LayerNorm
     - 2D RoPE (image patches get (row, col); text gets 1D) instead of learned
-      positional embeddings
-    - Grouped-query attention (GQA), full (non-windowed) attention on every layer
+      positional embeddings; for text it reduces exactly to Qwen3's 1D RoPE
+    - Grouped-query attention (GQA) with QK-Norm, full (non-windowed) attention
+      on every layer
     - SwiGLU MLP
     - tied input/output embedding
     - a linear patch projector (no vision encoder) that maps raw image patches
       straight into the model dimension
+    - the decoder can be loaded from Qwen3 0.6B Base (see ``qwen.load_qwen3``)
 
 Images and text share one sequence. The model itself does no preprocessing: the
 token ids, image patches, 2D-RoPE positions, image-slot mask, and attention mask
@@ -31,44 +33,52 @@ from config import Config
 
 
 def build_rope_cache(pos_h, pos_w, head_dim, base):
-    """Build the cos/sin rotation tables for 2D RoPE.
+    """Build the cos/sin rotation tables for 2D RoPE (Qwen3-compatible).
 
-    The head dimension is split into two equal halves. The first half is rotated
-    by the row coordinate (``pos_h``) and the second by the column coordinate
-    (``pos_w``). Each half is given its own full frequency spectrum (high to low),
-    so neither axis is biased toward high or low frequencies. For text tokens the
-    data pipeline sets ``pos_h == pos_w``, so both halves rotate by the same angle
-    and this reduces exactly to ordinary 1D RoPE.
+    Uses Qwen3's standard 1D-RoPE frequency layout (``head_dim // 2`` frequencies
+    over the full head, base ``rope_theta``, duplicated for the rotate-half pair),
+    but assigns frequencies to the two image axes by *interleaving*: even-indexed
+    frequencies rotate by the row coordinate (``pos_h``), odd-indexed by the column
+    (``pos_w``). Each axis therefore spans the full spectrum (no high/low bias).
+
+    The key property: for text tokens the data pipeline sets ``pos_h == pos_w``, so
+    every frequency rotates by the same position and this collapses *exactly* to
+    Qwen3's ordinary 1D RoPE -- which is what the loaded attention weights expect.
 
     Args:
         pos_h: Row positions, int tensor of shape [B, S].
         pos_w: Column positions, int tensor of shape [B, S].
         head_dim: Size of each attention head (must be divisible by 4).
-        base: RoPE base/theta controlling the frequency range (e.g. 10000).
+        base: RoPE base/theta controlling the frequency range (e.g. 1e6).
 
     Returns:
         A tuple ``(cos, sin)``, each a float tensor of shape [B, S, head_dim].
     """
-    half = head_dim // 2                      # dims driven by each coordinate
-    n_freq = half // 2                        # rotary pairs per coordinate
+    n_freq = head_dim // 2                     # Qwen3 1D-RoPE: one freq per rotate-half pair
     device = pos_h.device
     inv_freq = base ** (-torch.arange(0, n_freq, device=device, dtype=torch.float32) / n_freq)  # [n_freq]
 
-    def angles(pos):
-        # pos: [B, S] -> [B, S, n_freq] -> [B, S, half] (duplicated for the two halves of the rotation)
-        a = pos.float()[..., None] * inv_freq                       # [B, S, n_freq]
-        return torch.cat([a, a], dim=-1)                            # [B, S, half]
+    # interleave the two coordinates across the frequency spectrum
+    coord = torch.empty(*pos_h.shape, n_freq, device=device, dtype=torch.float32)  # [B, S, n_freq]
+    coord[..., 0::2] = pos_h.float()[..., None]    # even freqs <- row
+    coord[..., 1::2] = pos_w.float()[..., None]    # odd  freqs <- col
 
-    ang = torch.cat([angles(pos_h), angles(pos_w)], dim=-1)         # [B, S, head_dim]
-    return ang.cos(), ang.sin()
+    theta = coord * inv_freq                       # [B, S, n_freq]
+    emb = torch.cat([theta, theta], dim=-1)        # [B, S, head_dim] (standard RoPE duplication)
+    return emb.cos(), emb.sin()
+
+
+def rotate_half(x):
+    """Standard RoPE rotate-half: split the last dim in two and map (x1, x2) -> (-x2, x1)."""
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    return torch.cat([-x2, x1], dim=-1)
 
 
 def apply_rope(x, cos, sin):
     """Apply rotary position embedding to queries or keys.
 
-    Uses the GPT-NeoX "rotate_half" convention, applied independently within each
-    half of the head dim (the h-half and the w-half) so each axis's rotation stays
-    self-contained.
+    The standard GPT-NeoX / Qwen3 ``rotate_half`` convention over the full head dim.
 
     Args:
         x: Queries or keys, shape [B, H, S, head_dim].
@@ -78,20 +88,9 @@ def apply_rope(x, cos, sin):
     Returns:
         The rotated tensor, same shape as ``x``.
     """
-    half = x.shape[-1] // 2
-
-    def rotate_half_block(t):
-        # split a block into two and rotate: (-x2, x1)
-        d = t.shape[-1] // 2
-        x1, x2 = t[..., :d], t[..., d:]
-        return torch.cat([-x2, x1], dim=-1)
-
-    # process the h-half and w-half separately so rotation stays within each block
-    xh, xw = x[..., :half], x[..., half:]
-    rot = torch.cat([rotate_half_block(xh), rotate_half_block(xw)], dim=-1)
     cos = cos[:, None, :, :]  # [B, 1, S, head_dim]
     sin = sin[:, None, :, :]
-    return x * cos + rot * sin
+    return x * cos + rotate_half(x) * sin
 
 
 def scaled_dot_product_attention(q, k, v, attn_mask):
@@ -123,15 +122,17 @@ def scaled_dot_product_attention(q, k, v, attn_mask):
 
 
 class Attention(nn.Module):
-    """Grouped-query self-attention with 2D RoPE.
+    """Grouped-query self-attention with QK-Norm and 2D RoPE.
 
     Uses ``n_heads`` query heads but only ``n_kv_heads`` key/value heads (GQA);
-    the KV heads are repeated to match the query heads before attention. RoPE is
-    applied to queries and keys. There are no biases on the projections.
+    the KV heads are repeated to match the query heads before attention. Queries
+    and keys are RMS-normalized per head (QK-Norm, Qwen3-style) before RoPE is
+    applied. There are no biases on the projections. ``head_dim`` is decoupled
+    from ``d_model``, so the q/o projections need not be square.
     """
 
     def __init__(self, cfg: Config):
-        """Create the q/k/v/o projections sized from ``cfg``."""
+        """Create the q/k/v/o projections and the per-head q/k norms from ``cfg``."""
         super().__init__()
         self.n_heads = cfg.n_heads
         self.n_kv_heads = cfg.n_kv_heads
@@ -141,6 +142,10 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(cfg.d_model, cfg.n_kv_heads * cfg.head_dim, bias=False)
         self.v_proj = nn.Linear(cfg.d_model, cfg.n_kv_heads * cfg.head_dim, bias=False)
         self.o_proj = nn.Linear(cfg.n_heads * cfg.head_dim, cfg.d_model, bias=False)
+        # QK-Norm: RMSNorm over head_dim, applied to q and k before RoPE. Stabilizes
+        # the softmax (esp. with the high-entropy image tokens) and matches Qwen3.
+        self.q_norm = nn.RMSNorm(cfg.head_dim, eps=1e-6)
+        self.k_norm = nn.RMSNorm(cfg.head_dim, eps=1e-6)
 
     def forward(self, x, cos, sin, attn_mask):
         """Apply self-attention.
@@ -155,8 +160,9 @@ class Attention(nn.Module):
             Output hidden states, shape [B, S, d_model].
         """
         B, S, _ = x.shape
-        q = self.q_proj(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)     # [B, Hq, S, D]
-        k = self.k_proj(x).view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)  # [B, Hkv, S, D]
+        # QK-Norm over the head_dim (last axis) before the head/seq transpose.
+        q = self.q_norm(self.q_proj(x).view(B, S, self.n_heads, self.head_dim)).transpose(1, 2)     # [B, Hq, S, D]
+        k = self.k_norm(self.k_proj(x).view(B, S, self.n_kv_heads, self.head_dim)).transpose(1, 2)  # [B, Hkv, S, D]
         v = self.v_proj(x).view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         q = apply_rope(q, cos, sin)
@@ -219,6 +225,18 @@ class Block(nn.Module):
         return x
 
 
+# Parameters with no pretrained counterpart: the linear vision adapter, always
+# trained from scratch even when the decoder is loaded from a base model. The
+# optimizer (full LR vs. gentler fine-tune LR) and the base loader (which weights
+# to fill vs. leave random) both key off this.
+VISION_ADAPTER_PREFIXES = ("patch_proj", "patch_norm", "patch_pos_emb")
+
+
+def is_vision_adapter(name: str) -> bool:
+    """True for a parameter that belongs to the from-scratch vision adapter."""
+    return name.startswith(VISION_ADAPTER_PREFIXES)
+
+
 class NanoMark(nn.Module):
     """The full encoder-free OCR model.
 
@@ -246,6 +264,13 @@ class NanoMark(nn.Module):
         # normalize projected patches so the image-embedding scale is consistent
         # regardless of pixel/pad statistics (cf. Gemma's vision embedder)
         self.patch_norm = nn.RMSNorm(cfg.d_model, eps=1e-6)
+        # "learned" image positions (Gemma 4 Unified-style): a factorized 2D table
+        # looked up per-axis (row via [:, 0], col via [:, 1]) and summed onto the
+        # projected patch before patch_norm. Zero-init so a fresh learned model is
+        # numerically identical to a no-position baseline at step 0. Only created
+        # in this mode, so "rope2d" state_dicts are unchanged.
+        if cfg.image_pos_mode == "learned":
+            self.patch_pos_emb = nn.Parameter(torch.zeros(cfg.max_patch_grid, 2, cfg.d_model))
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
         self.final_norm = nn.RMSNorm(cfg.d_model, eps=1e-6)
         # the output head is tied to tok_emb.weight (applied in forward)
@@ -270,7 +295,7 @@ class NanoMark(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def trunk(self, input_ids, patches, image_slots, pos_h, pos_w, attn_mask):
+    def trunk(self, input_ids, patches, image_slots, pos_h, pos_w, attn_mask, patch_pos=None):
         """Run the transformer trunk and return final-normed hidden states.
 
         Everything in :meth:`forward` except the tied output projection. Split
@@ -286,15 +311,25 @@ class NanoMark(nn.Module):
             image_slots: Boolean mask, shape [B, S], True at image-patch
                 positions. ``image_slots[b].sum()`` equals sample ``b``'s patch
                 count, so it aligns with ``patches[b]``.
-            pos_h: Row positions for 2D RoPE, shape [B, S].
-            pos_w: Column positions for 2D RoPE, shape [B, S].
+            pos_h: Row positions for RoPE, shape [B, S].
+            pos_w: Column positions for RoPE, shape [B, S].
             attn_mask: Boolean attention mask, shape [B, 1, S, S] (True = attend).
+            patch_pos: Per-patch grid coordinates, shape [B, P, 2] (row, col),
+                ``-1`` on padding. Required when ``image_pos_mode == "learned"``
+                (indexes the learned positional table); ignored under "rope2d".
 
         Returns:
             Final hidden states, shape [B, S, d_model].
         """
         h = self.tok_emb(input_ids)                          # [B, S, d]
-        proj = self.patch_norm(self.patch_proj(patches))     # [B, P, d], scale-stabilized
+        proj = self.patch_proj(patches)                      # [B, P, d]
+        if self.cfg.image_pos_mode == "learned":
+            # factorized 2D lookup summed onto the patch, then normed (Gemma order)
+            assert patch_pos is not None, "image_pos_mode='learned' requires patch_pos"
+            rows = patch_pos[..., 0].clamp(min=0)            # -1 pad -> 0; scatter drops it
+            cols = patch_pos[..., 1].clamp(min=0)
+            proj = proj + self.patch_pos_emb[rows, 0] + self.patch_pos_emb[cols, 1]
+        proj = self.patch_norm(proj)                         # [B, P, d], scale-stabilized
 
         # splice projected patches into the image slots (per sample; see helper)
         h = _scatter_patches(h, proj, image_slots)
@@ -305,7 +340,7 @@ class NanoMark(nn.Module):
             h = block(h, cos, sin, attn_mask)
         return self.final_norm(h)
 
-    def forward(self, input_ids, patches, image_slots, pos_h, pos_w, attn_mask):
+    def forward(self, input_ids, patches, image_slots, pos_h, pos_w, attn_mask, patch_pos=None):
         """Compute next-token logits over the whole sequence.
 
         Args:
@@ -317,17 +352,19 @@ class NanoMark(nn.Module):
             image_slots: Boolean mask, shape [B, S], True at image-patch
                 positions. ``image_slots[b].sum()`` equals sample ``b``'s patch
                 count, so it aligns with ``patches[b]``.
-            pos_h: Row positions for 2D RoPE, shape [B, S].
-            pos_w: Column positions for 2D RoPE, shape [B, S].
+            pos_h: Row positions for RoPE, shape [B, S].
+            pos_w: Column positions for RoPE, shape [B, S].
             attn_mask: Boolean attention mask, shape [B, 1, S, S] (True = attend).
+            patch_pos: Per-patch grid coordinates [B, P, 2]; required under
+                ``image_pos_mode == "learned"`` (see :meth:`trunk`).
 
         Returns:
             Logits over the padded vocabulary, shape [B, S, padded_vocab].
         """
-        h = self.trunk(input_ids, patches, image_slots, pos_h, pos_w, attn_mask)
+        h = self.trunk(input_ids, patches, image_slots, pos_h, pos_w, attn_mask, patch_pos)
         return h @ self.tok_emb.weight.T                     # tied head, [B, S, padded_vocab]
 
-    def loss(self, input_ids, patches, image_slots, pos_h, pos_w, attn_mask, labels):
+    def loss(self, input_ids, patches, image_slots, pos_h, pos_w, attn_mask, labels, patch_pos=None):
         """Label-masked cross-entropy, projecting the head only where it matters.
 
         Equivalent to ``cross_entropy(forward(...), labels, ignore_index=-100)``
@@ -340,7 +377,7 @@ class NanoMark(nn.Module):
         the ones ``ignore_index`` would have masked out).
 
         Args:
-            input_ids/patches/image_slots/pos_h/pos_w/attn_mask: As in
+            input_ids/patches/image_slots/pos_h/pos_w/attn_mask/patch_pos: As in
                 :meth:`forward`.
             labels: Next-token targets, shape [B, S], with -100 at positions
                 excluded from the loss.
@@ -348,7 +385,7 @@ class NanoMark(nn.Module):
         Returns:
             A scalar cross-entropy loss tensor (computed in fp32).
         """
-        h = self.trunk(input_ids, patches, image_slots, pos_h, pos_w, attn_mask)
+        h = self.trunk(input_ids, patches, image_slots, pos_h, pos_w, attn_mask, patch_pos)
         keep = labels != -100                                # [B, S], True on text targets
         if not keep.any():                                   # all-masked batch: empty gather -> CE is NaN
             return h.sum() * 0.0                             # finite, zero-gradient, keeps the graph valid

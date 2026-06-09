@@ -15,6 +15,11 @@ Examples:
 import argparse
 import math
 import os
+
+# The HF fast tokenizer is used inside forked DataLoader workers; disable its
+# internal Rust parallelism so it can't deadlock or spam warnings on fork.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from dataclasses import asdict, replace
 from functools import partial
 
@@ -23,8 +28,8 @@ from torch.utils.data import DataLoader
 
 from config import Config
 from data import OCRDataset, collate_fn
-from model import NanoMark
-from optimizer import build_optimizers
+from model import NanoMark, is_vision_adapter
+from qwen import load_qwen3
 
 
 def pick_device(requested):
@@ -87,19 +92,64 @@ def forward_loss(model, batch):
         A scalar loss tensor (computed in fp32).
     """
     return model.loss(batch["input_ids"], batch["patches"], batch["image_slots"],
-                      batch["pos_h"], batch["pos_w"], batch["attn_mask"], batch["labels"])
+                      batch["pos_h"], batch["pos_w"], batch["attn_mask"], batch["labels"],
+                      batch["patch_pos"])
 
 
-def set_lr(muon, adamw, cfg, opt_step):
-    """Set both optimizers' learning rates from the schedule for ``opt_step``.
+def build_optimizer(model, cfg):
+    """Build the AdamW optimizer with weight-decay and LR groups.
 
-    Returns the schedule multiplier (in [0, 1]).
+    All parameters use AdamW (Muon was removed -- it is designed for from-scratch
+    pretraining, whereas NanoMark fine-tunes a pretrained base).
+
+    Weight decay: applied to 2D weight matrices (block matmuls, the patch
+    projector, the token embedding / tied head), not to 1D params (RMSNorm gains).
+
+    Learning-rate groups: params loaded from the pretrained base get their LR
+    scaled by ``cfg.lr_mult_pretrained`` while the fresh vision adapter
+    (``patch_proj``/``patch_norm``/``patch_pos_emb``) trains at the full base LR.
+    The schedule in :func:`set_lr` reads each group's ``lr_mult``.
+
+    Args:
+        model: The :class:`model.NanoMark` (or any module) to optimize.
+        cfg: Configuration providing learning rate, betas, and weight decay.
+
+    Returns:
+        A single ``torch.optim.AdamW``. Each param group carries an ``lr_mult`` key.
+    """
+    def lr_mult(name):
+        # fresh vision-adapter params train at the full base LR; everything else is
+        # loaded from the pretrained base and fine-tuned more gently.
+        return 1.0 if is_vision_adapter(name) else cfg.lr_mult_pretrained
+
+    # bucket params by (weight-decay, lr_mult) so each distinct combo is its own group
+    decay, nodecay = {}, {}  # lr_mult -> [params]
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        m = lr_mult(name)
+        if p.ndim >= 2:
+            decay.setdefault(m, []).append(p)     # matmuls, patch_proj, tok_emb (tied head)
+        else:
+            nodecay.setdefault(m, []).append(p)   # RMSNorm gains, biases
+
+    groups = (
+        [{"params": ps, "weight_decay": cfg.weight_decay, "lr_mult": m} for m, ps in decay.items()]
+        + [{"params": ps, "weight_decay": 0.0, "lr_mult": m} for m, ps in nodecay.items()]
+    )
+    return torch.optim.AdamW(groups, lr=cfg.lr, betas=cfg.adam_betas)
+
+
+def set_lr(opt, cfg, opt_step):
+    """Set the optimizer's learning rate from the schedule for ``opt_step``.
+
+    Each param group's per-group ``lr_mult`` (1.0 for the fresh vision adapter,
+    ``cfg.lr_mult_pretrained`` for base-loaded params) scales the base LR before
+    the shared warmup/cosine schedule. Returns the schedule multiplier (in [0, 1]).
     """
     scale = lr_scale(opt_step, cfg.warmup_steps, cfg.max_steps)
-    for g in muon.param_groups:
-        g["lr"] = cfg.lr_muon * scale
-    for g in adamw.param_groups:
-        g["lr"] = cfg.lr_adamw * scale
+    for g in opt.param_groups:
+        g["lr"] = cfg.lr * g.get("lr_mult", 1.0) * scale
     return scale
 
 
@@ -108,7 +158,7 @@ def amp_ctx(use_amp):
     return torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else torch.enable_grad()
 
 
-def train_step(model, batch, muon, adamw, cfg, step, use_amp):
+def train_step(model, batch, opt, cfg, step, use_amp):
     """Run one full optimization step (no accumulation) and return the loss.
 
     Used by the overfit-one-batch sanity mode. The main loop does its own
@@ -117,25 +167,22 @@ def train_step(model, batch, muon, adamw, cfg, step, use_amp):
     Args:
         model: The NanoMark model (in train mode).
         batch: A collated, on-device batch from :func:`data.collate_fn`.
-        muon: The Muon optimizer (block matmuls + patch projector).
-        adamw: The AdamW optimizer (embedding/head + norms).
-        cfg: Configuration (learning rates, schedule, grad clip).
+        opt: The AdamW optimizer.
+        cfg: Configuration (learning rate, schedule, grad clip).
         step: Current step index, for the LR schedule.
         use_amp: Whether to run the forward pass under bf16 autocast (CUDA only).
 
     Returns:
         The loss value as a Python float.
     """
-    set_lr(muon, adamw, cfg, step)
+    set_lr(opt, cfg, step)
     with amp_ctx(use_amp):
         loss = forward_loss(model, batch)
-    muon.zero_grad(set_to_none=True)
-    adamw.zero_grad(set_to_none=True)
+    opt.zero_grad(set_to_none=True)
     loss.backward()
     total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
     if torch.isfinite(total_norm):  # skip the update on a NaN/Inf grad so it can't poison the weights
-        muon.step()
-        adamw.step()
+        opt.step()
     return loss.item()
 
 
@@ -195,6 +242,12 @@ def parse_args():
     ap.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=d.use_wandb,
                     help="enable Weights & Biases logging")
     ap.add_argument("--wandb-project", default=d.wandb_project)
+    ap.add_argument("--run-name", default=d.wandb_run_name, help="W&B run display name (default: auto-generated)")
+    # base model (the decoder is always initialized from this; shape is read from it too)
+    ap.add_argument("--base-repo", default=d.base_repo, help="HF repo for the base tokenizer + weights + shape")
+    # vision positional scheme: parameter-free 2D RoPE vs. a learned 2D table
+    ap.add_argument("--image-pos-mode", default=d.image_pos_mode, choices=("rope2d", "learned"),
+                    help="how image patches carry 2D position (default: %(default)s)")
     # misc
     ap.add_argument("--device", default=d.device)
     ap.add_argument("--seed", type=int, default=d.seed)
@@ -236,15 +289,21 @@ def build_loaders(cfg):
 
 
 def build_cfg(args):
-    """Overlay CLI overrides onto Config() to get the runtime config."""
-    return replace(
-        Config(),
+    """Build the runtime config: model shape from the base model, CLI knobs on top.
+
+    :meth:`Config.from_base` reads ``args.base_repo``'s HF config for the decoder
+    shape (d_model/n_layers/...); the CLI overrides supply the data/schedule knobs.
+    """
+    return Config.from_base(
+        args.base_repo,
         dataset=args.dataset, split=args.split, image_col=args.image_col, text_col=args.text_col,
         max_rows=args.max_rows, eval_frac=args.eval_frac, num_workers=args.num_workers, epochs=args.epochs,
         batch_size=args.batch_size, grad_accum=args.grad_accum, max_seq_len=args.max_seq_len,
+        image_pos_mode=args.image_pos_mode,
         log_every=args.log_every, eval_every=args.eval_every,
         eval_batches=args.eval_batches, ckpt_every=args.ckpt_every, out_dir=args.out,
-        use_wandb=args.wandb, wandb_project=args.wandb_project, device=args.device, seed=args.seed,
+        use_wandb=args.wandb, wandb_project=args.wandb_project, wandb_run_name=args.run_name,
+        device=args.device, seed=args.seed,
     )
 
 
@@ -255,9 +314,19 @@ def main():
 
     device = pick_device(cfg.device)
     use_amp = device == "cuda"
-    model = NanoMark(cfg).to(device)
-    print(f"device={device}  params={sum(p.numel() for p in model.parameters())/1e6:.1f}M")
-    muon, adamw = build_optimizers(model, cfg)
+    if device == "cuda":
+        # TF32 tensor cores for the fp32 matmuls (logits/loss path); free speedup on
+        # A100 with no meaningful accuracy cost. The block matmuls already run in bf16
+        # under autocast.
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    model = NanoMark(cfg)
+    load_qwen3(model, cfg.base_repo)   # fill the decoder from the base; vision adapter stays fresh
+    model = model.to(device)
+    print(f"device={device}  base={cfg.base_repo}  "
+          f"params={sum(p.numel() for p in model.parameters())/1e6:.1f}M")
+    opt = build_optimizer(model, cfg)
     model.train()
 
     train_loader, eval_loader = build_loaders(cfg)
@@ -266,14 +335,14 @@ def main():
     if cfg.use_wandb:
         import wandb as _wandb
         wandb = _wandb
-        wandb.init(project=cfg.wandb_project, config=asdict(cfg))
+        wandb.init(project=cfg.wandb_project, name=cfg.wandb_run_name, config=asdict(cfg))
 
     # --- sanity mode: overfit a single batch ---
     if args.overfit_one_batch:
         ocfg = replace(cfg, max_steps=200, warmup_steps=max(1, round(cfg.warmup_ratio * 200)))
         batch = to_device(next(iter(train_loader)), device)
         for step in range(ocfg.max_steps):
-            loss = train_step(model, batch, muon, adamw, ocfg, step, use_amp)
+            loss = train_step(model, batch, opt, ocfg, step, use_amp)
             if step % cfg.log_every == 0:
                 print(f"step {step:4d}  loss {loss:.4f}")
         return
@@ -293,11 +362,11 @@ def main():
         print(f"  saved {path}")
 
     opt_step, micro, running = 0, 0, 0.0
-    muon.zero_grad(set_to_none=True)
-    adamw.zero_grad(set_to_none=True)
+    best_eval = float("inf")  # track the best eval loss so we can keep best.pt
+    opt.zero_grad(set_to_none=True)
     for epoch in range(cfg.epochs):
         for batch in train_loader:
-            set_lr(muon, adamw, cfg, opt_step)
+            set_lr(opt, cfg, opt_step)
             with amp_ctx(use_amp):
                 loss = forward_loss(model, to_device(batch, device)) / accum
             loss.backward()
@@ -310,15 +379,13 @@ def main():
             # --- one optimizer step (every `accum` micro-batches) ---
             total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             if torch.isfinite(total_norm):  # a NaN/Inf grad would clip to NaN and poison every later step
-                muon.step()
-                adamw.step()
+                opt.step()
             else:
                 print(f"  skipping step {opt_step}: non-finite grad norm")
-            muon.zero_grad(set_to_none=True)  # drop the (possibly bad) grads either way
-            adamw.zero_grad(set_to_none=True)
+            opt.zero_grad(set_to_none=True)  # drop the (possibly bad) grads either way
 
             if opt_step % cfg.log_every == 0:
-                lr = cfg.lr_adamw * lr_scale(opt_step, cfg.warmup_steps, cfg.max_steps)
+                lr = cfg.lr * lr_scale(opt_step, cfg.warmup_steps, cfg.max_steps)
                 print(f"epoch {epoch}  step {opt_step:6d}/{total_steps}  loss {running:.4f}  lr {lr:.2e}")
                 if wandb:
                     wandb.log({"train/loss": running, "lr": lr, "epoch": epoch}, step=opt_step)
@@ -327,6 +394,9 @@ def main():
                 print(f"  [eval] step {opt_step}  eval_loss {eval_loss:.4f}")
                 if wandb:
                     wandb.log({"eval/loss": eval_loss}, step=opt_step)
+                if eval_loss < best_eval:  # keep the best-eval checkpoint
+                    best_eval = eval_loss
+                    save_ckpt("best.pt", opt_step)
             if opt_step > 0 and opt_step % cfg.ckpt_every == 0:
                 save_ckpt(f"step{opt_step}.pt", opt_step)
 
@@ -337,13 +407,15 @@ def main():
     if micro % accum != 0:
         total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         if torch.isfinite(total_norm):
-            muon.step()
-            adamw.step()
+            opt.step()
 
     # final eval + checkpoint
     eval_loss = evaluate(model, eval_loader, device, cfg.eval_batches)
-    print(f"[final] step {opt_step}  eval_loss {eval_loss:.4f}")
+    print(f"[final] step {opt_step}  eval_loss {eval_loss:.4f}  (best {min(best_eval, eval_loss):.4f})")
     save_ckpt("final.pt", opt_step)
+    if eval_loss < best_eval:  # the final weights are also the best-eval weights
+        best_eval = eval_loss
+        save_ckpt("best.pt", opt_step)
     if wandb:
         wandb.log({"eval/loss": eval_loss}, step=opt_step)
         wandb.finish()

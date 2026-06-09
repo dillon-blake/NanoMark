@@ -16,15 +16,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))                  
 from config import Config
 from data import (PAD_IMG, REAL_IMG, SEQ_PAD, TEXT, OCRDataset, build_attn_mask,
                   build_sample, collate_fn, get_tokenizer, preprocess_image)
-from model import NanoMark, apply_rope, build_rope_cache
-from optimizer import build_optimizers
+from model import NanoMark, apply_rope, build_rope_cache, is_vision_adapter
 from synthetic import render
+from train import build_optimizer
 
 
 def small_cfg(**kw):
-    """A tiny but architecturally identical config, for fast tests."""
+    """A tiny but architecturally identical config, for fast tests.
+
+    Passes the model shape explicitly (the real pipeline reads it from the base
+    model via ``Config.from_base``; tests build a tiny model with no base). The
+    vocab matches the Qwen3 tokenizer the tests tokenize with.
+    """
     base = dict(d_model=32, n_heads=4, n_kv_heads=2, head_dim=8, mlp_hidden=64,
-                n_layers=2, patch_size=8, max_image_px=64)
+                n_layers=2, patch_size=8, max_image_px=64, rope_base=1000000.0,
+                vocab_size=151936, padded_vocab=151936)
     base.update(kw)
     return Config(**base)
 
@@ -116,8 +122,10 @@ def test_bidirectional_image():
     patches2 = b["patches"].clone()
     torch.manual_seed(1)
     # non-uniform perturbation: changes the patch's direction. (A uniform add
-    # would be cancelled by patch_norm, which is scale-invariant.)
-    patches2[0, j_seq - 1] += torch.randn(cfg.patch_dim)  # patch array idx = seq pos - 1 (BOS at 0)
+    # would be cancelled by patch_norm, which is scale-invariant.) Scaled up so the
+    # forward-attention effect clears the tolerance even with QK-Norm damping the
+    # attention logits in this tiny random-init net.
+    patches2[0, j_seq - 1] += 5.0 * torch.randn(cfg.patch_dim)  # patch array idx = seq pos - 1 (BOS at 0)
     out2 = model(b["input_ids"], patches2, b["image_slots"], b["pos_h"], b["pos_w"], b["attn_mask"])
 
     # earlier image token's output changes because it attends forward to patch j
@@ -347,27 +355,26 @@ def test_sequence_assembly():
 def test_optimizer_split():
     cfg = small_cfg()
     model = NanoMark(cfg)
-    muon, adamw = build_optimizers(model, cfg)
+    opt = build_optimizer(model, cfg)
 
-    muon_ids = {id(p) for g in muon.param_groups for p in g["params"]}
-    adamw_decay_ids = {id(p) for p in adamw.param_groups[0]["params"]}
-    adamw_nodecay_ids = {id(p) for p in adamw.param_groups[1]["params"]}
+    # weight-decay groups carry decay; the rest don't
+    decay_ids = {id(p) for g in opt.param_groups if g["weight_decay"] > 0 for p in g["params"]}
+    nodecay_ids = {id(p) for g in opt.param_groups if g["weight_decay"] == 0 for p in g["params"]}
 
     # disjoint and complete
-    assert muon_ids.isdisjoint(adamw_decay_ids)
-    assert muon_ids.isdisjoint(adamw_nodecay_ids)
-    assert adamw_decay_ids.isdisjoint(adamw_nodecay_ids)
-    all_ids = muon_ids | adamw_decay_ids | adamw_nodecay_ids
+    assert decay_ids.isdisjoint(nodecay_ids)
+    all_ids = decay_ids | nodecay_ids
     assert all_ids == {id(p) for p in model.parameters() if p.requires_grad}
 
-    # routing: block matmuls + patch_proj -> Muon; tok_emb -> adamw decay; norms -> nodecay
-    assert id(model.patch_proj.weight) in muon_ids
-    assert id(model.blocks[0].attn.q_proj.weight) in muon_ids
-    assert id(model.blocks[0].mlp.gate.weight) in muon_ids
-    assert id(model.tok_emb.weight) in adamw_decay_ids
-    assert id(model.final_norm.weight) in adamw_nodecay_ids
-    # Muon only ever gets 2D params
-    assert all(p.ndim == 2 for g in muon.param_groups for p in g["params"])
+    # routing: 2D weights (matmuls, patch_proj, tok_emb) -> decay; 1D norms -> nodecay
+    assert id(model.patch_proj.weight) in decay_ids
+    assert id(model.blocks[0].attn.q_proj.weight) in decay_ids
+    assert id(model.blocks[0].mlp.gate.weight) in decay_ids
+    assert id(model.tok_emb.weight) in decay_ids
+    assert id(model.final_norm.weight) in nodecay_ids
+    # weight-decay groups only ever hold 2D params
+    assert all(p.ndim >= 2 for g in opt.param_groups if g["weight_decay"] > 0 for p in g["params"])
+    assert all(p.ndim == 1 for g in opt.param_groups if g["weight_decay"] == 0 for p in g["params"])
 
 
 # --------------------------------------------------------------------------- #
@@ -389,3 +396,81 @@ def test_forward_backward_smoke():
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     assert len(grads) > 0
     assert all(torch.isfinite(g).all() for g in grads)
+
+
+# --------------------------------------------------------------------------- #
+# 11. learned image positional embeddings (Gemma-4-Unified-style)
+# --------------------------------------------------------------------------- #
+def test_learned_positions_are_sequential():
+    # in "learned" mode image tokens take ordinary 1D RoPE positions like text:
+    # pos_h == pos_w == sequential index over the WHOLE sequence.
+    cfg = small_cfg(image_pos_mode="learned")
+    text = "data model patch"
+    s = build_sample(render(text), text, get_tokenizer(), cfg)
+    ph, pw, S = s["pos_h"], s["pos_w"], s["input_ids"].shape[0]
+    assert torch.equal(ph, pw)
+    assert torch.equal(ph, torch.arange(S, dtype=ph.dtype))
+
+
+def test_patch_pos_grid_coords():
+    # patch_pos is the raw 0-based (row, col) per patch in raster order
+    from PIL import Image
+    cfg = small_cfg()  # patch_size=8, max_image_px=64; emitted regardless of mode
+    s = build_sample(Image.new("L", (16, 8), 255), "hi", get_tokenizer(), cfg)  # rr=1, cc=2, G=2
+    assert s["patch_pos"].tolist() == [[0, 0], [0, 1], [1, 0], [1, 1]]
+
+
+def test_collate_patch_pos_padding():
+    # short sample's patches are padded with the (-1, -1) sentinel up to batch P
+    from PIL import Image
+    cfg = small_cfg(image_pos_mode="learned")
+    tok = get_tokenizer()
+    s_small = build_sample(Image.new("L", (8, 8), 255), "hi", tok, cfg)   # G=1, P=1
+    s_big = build_sample(Image.new("L", (16, 8), 255), "hi", tok, cfg)    # G=2, P=4
+    batch = collate_fn([s_small, s_big], cfg)
+    assert batch["patch_pos"].shape == (2, 4, 2)
+    assert batch["patch_pos"][0, 0].tolist() == [0, 0]
+    assert (batch["patch_pos"][0, 1:] == -1).all()  # padding sentinel
+    assert (batch["patch_pos"][1] >= 0).all()        # big sample fully real
+
+
+def test_learned_table_is_fresh_vision_adapter():
+    # the learned table must be recognized as a from-scratch vision-adapter param
+    # so the Qwen loader leaves it random and the optimizer gives it the full LR.
+    cfg = small_cfg(image_pos_mode="learned")
+    model = NanoMark(cfg)
+    assert is_vision_adapter("patch_pos_emb")
+    assert any(n == "patch_pos_emb" for n, _ in model.named_parameters())
+    opt = build_optimizer(model, cfg)
+    for g in opt.param_groups:
+        if any(p is model.patch_pos_emb for p in g["params"]):
+            assert g["lr_mult"] == 1.0                       # fresh -> full LR
+            assert g["weight_decay"] == cfg.weight_decay     # ndim>=2 -> decayed
+            break
+    else:
+        raise AssertionError("patch_pos_emb not found in any optimizer group")
+
+
+def test_rope2d_mode_has_no_table():
+    # the default mode creates no positional table -> rope2d state_dicts unchanged
+    assert not any(n.startswith("patch_pos_emb") for n, _ in NanoMark(small_cfg()).named_parameters())
+    assert hasattr(NanoMark(small_cfg(image_pos_mode="learned")), "patch_pos_emb")
+
+
+def test_learned_forward_backward_smoke():
+    cfg = small_cfg(image_pos_mode="learned")
+    torch.manual_seed(0)
+    model = NanoMark(cfg)
+    _, b = make_batch(cfg)
+    logits = model(b["input_ids"], b["patches"], b["image_slots"],
+                   b["pos_h"], b["pos_w"], b["attn_mask"], b["patch_pos"])
+    assert logits.shape == (1, b["input_ids"].shape[1], cfg.padded_vocab)
+    assert torch.isfinite(logits).all()
+
+    loss = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.size(-1)), b["labels"].reshape(-1), ignore_index=-100)
+    loss.backward()
+    # the learned table participates: gradient present, finite, and non-zero
+    assert model.patch_pos_emb.grad is not None
+    assert torch.isfinite(model.patch_pos_emb.grad).all()
+    assert model.patch_pos_emb.grad.abs().sum() > 0
