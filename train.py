@@ -27,9 +27,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from config import Config
-from data import OCRDataset, collate_fn
+from data import OCRDataset, collate_fn, resolve_attn_mask
 from model import NanoMark, is_vision_adapter
-from qwen import load_qwen3
+from granite import load_granite
 
 
 def pick_device(requested):
@@ -70,8 +70,21 @@ def lr_scale(step, warmup, max_steps):
 
 
 def to_device(batch, device):
-    """Move every tensor in a collated batch dict to ``device``."""
-    return {k: v.to(device) for k, v in batch.items()}
+    """Move every tensor in a collated batch dict to ``device`` (skipping None)."""
+    return {k: (v.to(device) if v is not None else None) for k, v in batch.items()}
+
+
+def prepare_batch(batch, cfg, device):
+    """Move a batch to ``device`` and build its attention mask there.
+
+    On the flex path ``collate_fn`` leaves ``attn_mask`` None; the on-device BlockMask
+    is built here (outside the compiled trunk) via :func:`data.resolve_attn_mask`. On
+    the dense path the mask was already built in collate and is passed through.
+    """
+    batch = to_device(batch, device)
+    if batch.get("attn_mask") is None:
+        batch["attn_mask"] = resolve_attn_mask(batch["token_type"], cfg)
+    return batch
 
 
 def forward_loss(model, batch):
@@ -204,10 +217,37 @@ def evaluate(model, loader, device, max_batches=None):
     for i, batch in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
-        total += forward_loss(model, to_device(batch, device)).item()
+        total += forward_loss(model, prepare_batch(batch, model.cfg, device)).item()
         n += 1
     model.train()
     return total / max(1, n)
+
+
+def maybe_upload_to_hf(cfg):
+    """Push best.pt to ``cfg.hf_repo`` (created private) if HF_TOKEN is set.
+
+    No-op when HF_TOKEN is absent. The token is read from the env and passed
+    explicitly to :class:`huggingface_hub.HfApi`, so no global ``huggingface-cli
+    login`` is required. Logs and skips gracefully if hf_repo is unset or there is
+    no checkpoint to upload.
+    """
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        return
+    if not cfg.hf_repo:
+        print("  HF_TOKEN set but cfg.hf_repo is empty; skipping HuggingFace upload")
+        return
+    best = os.path.join(cfg.out_dir, "best.pt")
+    if not os.path.exists(best):
+        print(f"  no {best} to upload; skipping HuggingFace upload")
+        return
+    from huggingface_hub import HfApi
+    api = HfApi(token=token)
+    api.create_repo(cfg.hf_repo, repo_type="model", private=True, exist_ok=True)
+    print(f"  uploading {best} -> {cfg.hf_repo}")
+    api.upload_file(path_or_fileobj=best, path_in_repo="best.pt",
+                    repo_id=cfg.hf_repo, repo_type="model")
+    print(f"  uploaded to https://huggingface.co/{cfg.hf_repo}")
 
 
 def parse_args():
@@ -280,10 +320,15 @@ def build_loaders(cfg):
     loader_kwargs = {}
     if cfg.num_workers > 0:
         loader_kwargs = {"persistent_workers": True, "prefetch_factor": cfg.prefetch_factor}
+    # The flex path compiles the trunk with static shapes, so drop the trailing partial
+    # batch to keep the batch dim constant (avoids a recompile on the smaller tail batch).
+    drop_last = cfg.attn_impl == "flex"
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate,
-                              num_workers=cfg.num_workers, pin_memory=pin_memory, **loader_kwargs)
+                              num_workers=cfg.num_workers, pin_memory=pin_memory, drop_last=drop_last,
+                              **loader_kwargs)
     eval_loader = DataLoader(eval_ds, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate,
-                             num_workers=cfg.num_workers, pin_memory=pin_memory, **loader_kwargs)
+                             num_workers=cfg.num_workers, pin_memory=pin_memory, drop_last=drop_last,
+                             **loader_kwargs)
     print(f"train rows={len(train_ds)}  eval rows={len(eval_ds)}  steps/epoch={len(train_loader)}")
     return train_loader, eval_loader
 
@@ -322,8 +367,13 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     model = NanoMark(cfg)
-    load_qwen3(model, cfg.base_repo)   # fill the decoder from the base; vision adapter stays fresh
+    load_granite(model, cfg.base_repo)   # fill the decoder from the base; vision adapter stays fresh
     model = model.to(device)
+    if cfg.attn_impl == "flex" and device == "cuda":
+        # Compile the shared transformer trunk (attention included). Both forward and
+        # loss route through trunk; the LM-head projection in loss stays eager. Collate
+        # pads to max_seq_len + drop_last keeps shapes static, so this compiles once.
+        model.trunk = torch.compile(model.trunk)
     print(f"device={device}  base={cfg.base_repo}  "
           f"params={sum(p.numel() for p in model.parameters())/1e6:.1f}M")
     opt = build_optimizer(model, cfg)
@@ -335,12 +385,15 @@ def main():
     if cfg.use_wandb:
         import wandb as _wandb
         wandb = _wandb
+        key = os.environ.get("WANDB_API_KEY")
+        if key:  # authenticate from the env var so headless/CI runs need no prior `wandb login`
+            wandb.login(key=key)
         wandb.init(project=cfg.wandb_project, name=cfg.wandb_run_name, config=asdict(cfg))
 
     # --- sanity mode: overfit a single batch ---
     if args.overfit_one_batch:
         ocfg = replace(cfg, max_steps=200, warmup_steps=max(1, round(cfg.warmup_ratio * 200)))
-        batch = to_device(next(iter(train_loader)), device)
+        batch = prepare_batch(next(iter(train_loader)), cfg, device)
         for step in range(ocfg.max_steps):
             loss = train_step(model, batch, opt, ocfg, step, use_amp)
             if step % cfg.log_every == 0:
@@ -368,7 +421,7 @@ def main():
         for batch in train_loader:
             set_lr(opt, cfg, opt_step)
             with amp_ctx(use_amp):
-                loss = forward_loss(model, to_device(batch, device)) / accum
+                loss = forward_loss(model, prepare_batch(batch, cfg, device)) / accum
             loss.backward()
             running += loss.item()
             micro += 1
@@ -419,6 +472,8 @@ def main():
     if wandb:
         wandb.log({"eval/loss": eval_loss}, step=opt_step)
         wandb.finish()
+
+    maybe_upload_to_hf(cfg)
 
 
 if __name__ == "__main__":

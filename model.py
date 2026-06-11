@@ -1,22 +1,24 @@
 """The NanoMark model: an encoder-free OCR decoder.
 
-A Qwen3-0.6B-shaped decoder-only transformer with modern components:
+A Granite-4.0-350M-shaped decoder-only transformer with modern components:
     - RMSNorm (``torch.nn.RMSNorm``) instead of LayerNorm
     - 2D RoPE (image patches get (row, col); text gets 1D) instead of learned
-      positional embeddings; for text it reduces exactly to Qwen3's 1D RoPE
-    - Grouped-query attention (GQA) with QK-Norm, full (non-windowed) attention
-      on every layer
+      positional embeddings; for text it reduces exactly to Granite's 1D RoPE
+    - Grouped-query attention (GQA), full (non-windowed) attention on every layer
+    - Granite muP-style scalar multipliers (embedding / attention / residual /
+      logits); see ``config.Config`` and the base model's ``config.json``
     - SwiGLU MLP
     - tied input/output embedding
     - a linear patch projector (no vision encoder) that maps raw image patches
       straight into the model dimension
-    - the decoder can be loaded from Qwen3 0.6B Base (see ``qwen.load_qwen3``)
+    - the decoder can be loaded from Granite-4.0-350M Base (see ``granite.load_granite``)
 
 Images and text share one sequence. The model itself does no preprocessing: the
 token ids, image patches, 2D-RoPE positions, image-slot mask, and attention mask
 are all produced by ``data.py`` and passed into :meth:`NanoMark.forward`. The
-attention mask is boolean (bidirectional over image patches, causal over text,
-with padding masked) — see :func:`data.build_attn_mask`.
+attention mask is boolean (image patches bidirectional or causal per
+``cfg.bidirectional_img``, causal over text, with padding masked) — see
+:func:`data.build_attn_mask`.
 
 Tensor shape conventions used throughout:
     B = batch, S = sequence length, P = image patches per sample,
@@ -31,19 +33,26 @@ import torch.nn.functional as F
 
 from config import Config
 
+try:
+    from torch.nn.attention.flex_attention import BlockMask, flex_attention
+    _FLEX_AVAILABLE = True
+except ImportError:  # torch < 2.5
+    BlockMask = None
+    _FLEX_AVAILABLE = False
+
 
 def build_rope_cache(pos_h, pos_w, head_dim, base):
-    """Build the cos/sin rotation tables for 2D RoPE (Qwen3-compatible).
+    """Build the cos/sin rotation tables for 2D RoPE (Granite-compatible).
 
-    Uses Qwen3's standard 1D-RoPE frequency layout (``head_dim // 2`` frequencies
-    over the full head, base ``rope_theta``, duplicated for the rotate-half pair),
-    but assigns frequencies to the two image axes by *interleaving*: even-indexed
+    Uses the standard 1D-RoPE frequency layout (``head_dim // 2`` frequencies over
+    the full head, base ``rope_theta``, duplicated for the rotate-half pair), but
+    assigns frequencies to the two image axes by *interleaving*: even-indexed
     frequencies rotate by the row coordinate (``pos_h``), odd-indexed by the column
     (``pos_w``). Each axis therefore spans the full spectrum (no high/low bias).
 
     The key property: for text tokens the data pipeline sets ``pos_h == pos_w``, so
     every frequency rotates by the same position and this collapses *exactly* to
-    Qwen3's ordinary 1D RoPE -- which is what the loaded attention weights expect.
+    Granite's ordinary 1D RoPE -- which is what the loaded attention weights expect.
 
     Args:
         pos_h: Row positions, int tensor of shape [B, S].
@@ -54,7 +63,7 @@ def build_rope_cache(pos_h, pos_w, head_dim, base):
     Returns:
         A tuple ``(cos, sin)``, each a float tensor of shape [B, S, head_dim].
     """
-    n_freq = head_dim // 2                     # Qwen3 1D-RoPE: one freq per rotate-half pair
+    n_freq = head_dim // 2                     # standard 1D-RoPE: one freq per rotate-half pair
     device = pos_h.device
     inv_freq = base ** (-torch.arange(0, n_freq, device=device, dtype=torch.float32) / n_freq)  # [n_freq]
 
@@ -78,7 +87,7 @@ def rotate_half(x):
 def apply_rope(x, cos, sin):
     """Apply rotary position embedding to queries or keys.
 
-    The standard GPT-NeoX / Qwen3 ``rotate_half`` convention over the full head dim.
+    The standard GPT-NeoX / Granite ``rotate_half`` convention over the full head dim.
 
     Args:
         x: Queries or keys, shape [B, H, S, head_dim].
@@ -93,59 +102,66 @@ def apply_rope(x, cos, sin):
     return x * cos + rotate_half(x) * sin
 
 
-def scaled_dot_product_attention(q, k, v, attn_mask):
+def scaled_dot_product_attention(q, k, v, attn_mask, scale=None):
     """Run attention via PyTorch's fused kernel, with a naive fallback.
 
-    Prefers ``F.scaled_dot_product_attention`` (which dispatches to FlashAttention
-    / memory-efficient kernels) and falls back to an explicit softmax when it is
-    unavailable.
+    Dispatches on the mask type: a FlexAttention ``BlockMask`` runs the fused,
+    block-sparse flex kernel; otherwise prefers ``F.scaled_dot_product_attention``
+    (FlashAttention / memory-efficient kernels) and falls back to an explicit softmax
+    when it is unavailable.
 
     Args:
         q: Queries, shape [B, H, S, D].
         k: Keys, shape [B, H, S, D] (already expanded to H heads for GQA).
         v: Values, shape [B, H, S, D] (already expanded to H heads for GQA).
-        attn_mask: Boolean mask of shape [B, 1, S, S] where True = attend and
-            False = block. Every query row must have at least one True entry, or
-            softmax sees all -inf and returns NaN; :func:`data.collate_fn`
-            guarantees this.
+        attn_mask: Either a FlexAttention ``BlockMask`` (flex path) or a boolean
+            tensor of shape [B, 1, S, S] where True = attend and False = block. Every
+            query row must have at least one True entry, or softmax sees all -inf and
+            returns NaN; :func:`data.build_attn_mask` / the mask_mod guarantee this.
+        scale: Softmax temperature applied to the QK scores. ``None`` uses the
+            default ``1/sqrt(D)``; Granite passes its ``attention_multiplier``
+            (= 1/head_dim, not 1/sqrt(head_dim)) here.
 
     Returns:
         The attention output, shape [B, H, S, D].
     """
+    if _FLEX_AVAILABLE and isinstance(attn_mask, BlockMask):
+        # FlexAttention: fused + block-sparse; compiled as part of the trunk graph.
+        # Default scale (None) is 1/sqrt(D), matching SDPA; Granite's multiplier passes through.
+        return flex_attention(q, k, v, block_mask=attn_mask, scale=scale)
     if hasattr(F, "scaled_dot_product_attention"):
-        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=scale)
     # naive fallback
-    scores = (q @ k.transpose(-2, -1)) / math.sqrt(q.shape[-1])  # [B, H, S, S]
+    s = scale if scale is not None else 1.0 / math.sqrt(q.shape[-1])
+    scores = (q @ k.transpose(-2, -1)) * s                       # [B, H, S, S]
     scores = scores.masked_fill(~attn_mask, float("-inf"))
     weights = scores.softmax(dim=-1)
     return weights @ v
 
 
 class Attention(nn.Module):
-    """Grouped-query self-attention with QK-Norm and 2D RoPE.
+    """Grouped-query self-attention with 2D RoPE (Granite-style, no QK-Norm).
 
     Uses ``n_heads`` query heads but only ``n_kv_heads`` key/value heads (GQA);
-    the KV heads are repeated to match the query heads before attention. Queries
-    and keys are RMS-normalized per head (QK-Norm, Qwen3-style) before RoPE is
-    applied. There are no biases on the projections. ``head_dim`` is decoupled
-    from ``d_model``, so the q/o projections need not be square.
+    the KV heads are repeated to match the query heads before attention. There are
+    no biases on the projections, and ``head_dim`` is decoupled from ``d_model``,
+    so the q/o projections need not be square. The softmax score scale is
+    ``cfg.attention_multiplier`` (Granite's muP scale, = 1/head_dim) when set,
+    else the usual ``1/sqrt(head_dim)``.
     """
 
     def __init__(self, cfg: Config):
-        """Create the q/k/v/o projections and the per-head q/k norms from ``cfg``."""
+        """Create the q/k/v/o projections from ``cfg``."""
         super().__init__()
         self.n_heads = cfg.n_heads
         self.n_kv_heads = cfg.n_kv_heads
         self.head_dim = cfg.head_dim
         self.n_rep = cfg.n_heads // cfg.n_kv_heads
+        self.scale = cfg.attention_multiplier
         self.q_proj = nn.Linear(cfg.d_model, cfg.n_heads * cfg.head_dim, bias=False)
         self.k_proj = nn.Linear(cfg.d_model, cfg.n_kv_heads * cfg.head_dim, bias=False)
         self.v_proj = nn.Linear(cfg.d_model, cfg.n_kv_heads * cfg.head_dim, bias=False)
         self.o_proj = nn.Linear(cfg.n_heads * cfg.head_dim, cfg.d_model, bias=False)
-        # QK-Norm: RMSNorm over head_dim, applied to q and k before RoPE. Stabilizes
-        # the softmax (esp. with the high-entropy image tokens) and matches Qwen3.
-        self.q_norm = nn.RMSNorm(cfg.head_dim, eps=1e-6)
-        self.k_norm = nn.RMSNorm(cfg.head_dim, eps=1e-6)
 
     def forward(self, x, cos, sin, attn_mask):
         """Apply self-attention.
@@ -160,9 +176,8 @@ class Attention(nn.Module):
             Output hidden states, shape [B, S, d_model].
         """
         B, S, _ = x.shape
-        # QK-Norm over the head_dim (last axis) before the head/seq transpose.
-        q = self.q_norm(self.q_proj(x).view(B, S, self.n_heads, self.head_dim)).transpose(1, 2)     # [B, Hq, S, D]
-        k = self.k_norm(self.k_proj(x).view(B, S, self.n_kv_heads, self.head_dim)).transpose(1, 2)  # [B, Hkv, S, D]
+        q = self.q_proj(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)     # [B, Hq, S, D]
+        k = self.k_proj(x).view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)  # [B, Hkv, S, D]
         v = self.v_proj(x).view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         q = apply_rope(q, cos, sin)
@@ -172,7 +187,7 @@ class Attention(nn.Module):
         k = k.repeat_interleave(self.n_rep, dim=1)
         v = v.repeat_interleave(self.n_rep, dim=1)
 
-        out = scaled_dot_product_attention(q, k, v, attn_mask)         # [B, Hq, S, D]
+        out = scaled_dot_product_attention(q, k, v, attn_mask, scale=self.scale)  # [B, Hq, S, D]
         out = out.transpose(1, 2).contiguous().view(B, S, -1)
         return self.o_proj(out)
 
@@ -181,7 +196,7 @@ class SwiGLU(nn.Module):
     """SwiGLU feed-forward network: ``down(silu(gate(x)) * up(x))``.
 
     Three bias-free projections (gate, up, down). The SiLU-gated formulation is
-    the standard Llama/Qwen MLP; ``cfg.mlp_hidden`` is sized to roughly match a
+    the standard Llama/Granite MLP; ``cfg.mlp_hidden`` is sized to roughly match a
     plain 4x GELU MLP's parameter count.
     """
 
@@ -203,10 +218,13 @@ class Block(nn.Module):
     def __init__(self, cfg: Config):
         """Create the two RMSNorms, the attention, and the MLP."""
         super().__init__()
-        self.attn_norm = nn.RMSNorm(cfg.d_model, eps=1e-6)
+        self.attn_norm = nn.RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
         self.attn = Attention(cfg)
-        self.mlp_norm = nn.RMSNorm(cfg.d_model, eps=1e-6)
+        self.mlp_norm = nn.RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
         self.mlp = SwiGLU(cfg)
+        # Granite scales every sublayer output before adding it to the residual
+        # stream (muP); 1.0 recovers the ordinary residual connection.
+        self.residual_multiplier = cfg.residual_multiplier
 
     def forward(self, x, cos, sin, attn_mask):
         """Run the block.
@@ -220,8 +238,8 @@ class Block(nn.Module):
         Returns:
             Output hidden states, shape [B, S, d_model].
         """
-        x = x + self.attn(self.attn_norm(x), cos, sin, attn_mask)
-        x = x + self.mlp(self.mlp_norm(x))
+        x = x + self.residual_multiplier * self.attn(self.attn_norm(x), cos, sin, attn_mask)
+        x = x + self.residual_multiplier * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -263,7 +281,7 @@ class NanoMark(nn.Module):
         self.patch_proj = nn.Linear(cfg.patch_dim, cfg.d_model, bias=False)
         # normalize projected patches so the image-embedding scale is consistent
         # regardless of pixel/pad statistics (cf. Gemma's vision embedder)
-        self.patch_norm = nn.RMSNorm(cfg.d_model, eps=1e-6)
+        self.patch_norm = nn.RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
         # "learned" image positions (Gemma 4 Unified-style): a factorized 2D table
         # looked up per-axis (row via [:, 0], col via [:, 1]) and summed onto the
         # projected patch before patch_norm. Zero-init so a fresh learned model is
@@ -272,7 +290,7 @@ class NanoMark(nn.Module):
         if cfg.image_pos_mode == "learned":
             self.patch_pos_emb = nn.Parameter(torch.zeros(cfg.max_patch_grid, 2, cfg.d_model))
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
-        self.final_norm = nn.RMSNorm(cfg.d_model, eps=1e-6)
+        self.final_norm = nn.RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
         # the output head is tied to tok_emb.weight (applied in forward)
         self.apply(self._init_weights)
         # GPT-2-style: scale residual output projections by 1/sqrt(2*n_layers)
@@ -334,6 +352,11 @@ class NanoMark(nn.Module):
         # splice projected patches into the image slots (per sample; see helper)
         h = _scatter_patches(h, proj, image_slots)
 
+        # Granite scales the input embeddings (muP); applied to the whole stream so
+        # text tokens match the base model and patches share the same scale. 1.0 is
+        # the no-op default for a non-Granite base.
+        h = h * self.cfg.embedding_multiplier
+
         cos, sin = build_rope_cache(pos_h, pos_w, self.cfg.head_dim, self.cfg.rope_base)
         cos, sin = cos.to(h.dtype), sin.to(h.dtype)
         for block in self.blocks:
@@ -362,7 +385,8 @@ class NanoMark(nn.Module):
             Logits over the padded vocabulary, shape [B, S, padded_vocab].
         """
         h = self.trunk(input_ids, patches, image_slots, pos_h, pos_w, attn_mask, patch_pos)
-        return h @ self.tok_emb.weight.T                     # tied head, [B, S, padded_vocab]
+        # tied head, [B, S, padded_vocab]; Granite divides logits by logits_scaling (muP)
+        return (h @ self.tok_emb.weight.T) / self.cfg.logits_scaling
 
     def loss(self, input_ids, patches, image_slots, pos_h, pos_w, attn_mask, labels, patch_pos=None):
         """Label-masked cross-entropy, projecting the head only where it matters.
@@ -390,7 +414,7 @@ class NanoMark(nn.Module):
         if not keep.any():                                   # all-masked batch: empty gather -> CE is NaN
             return h.sum() * 0.0                             # finite, zero-gradient, keeps the graph valid
         h_kept = h[keep]                                     # [N, d], gathered across the batch
-        logits = (h_kept @ self.tok_emb.weight.T).float()    # [N, padded_vocab]
+        logits = (h_kept @ self.tok_emb.weight.T).float() / self.cfg.logits_scaling  # [N, padded_vocab]
         return F.cross_entropy(logits, labels[keep])
 
 

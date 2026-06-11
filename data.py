@@ -30,6 +30,13 @@ from torch.utils.data import Dataset
 
 from config import BASE_REPO, Config
 
+try:
+    from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+    _FLEX_AVAILABLE = True
+except ImportError:  # torch < 2.5
+    BlockMask = None
+    _FLEX_AVAILABLE = False
+
 TEXT, REAL_IMG, PAD_IMG, SEQ_PAD = 0, 1, 2, 3
 
 
@@ -43,15 +50,15 @@ def patch_grid_coords(G: int) -> list[tuple[int, int]]:
 
 
 def get_tokenizer(repo: str = BASE_REPO):
-    """Return the base model's tokenizer (the Qwen3 byte-level BPE tokenizer).
+    """Return the base model's tokenizer (the Granite-4.0 byte-level BPE tokenizer).
 
     Args:
         repo: HF repo id whose tokenizer to load (the NanoMark base model).
 
     Returns:
-        A HuggingFace fast tokenizer (~151,936-token vocabulary). NanoMark's
-        structural markers (BOS/SOC/EOS) reuse existing Qwen3 control-token ids and
-        are inserted by hand in :func:`build_sample`, never emitted by ``encode``.
+        A HuggingFace fast tokenizer (~100,352-token vocabulary). NanoMark's
+        structural markers (BOS/SOC/EOS) reuse existing Granite control-token ids
+        and are inserted by hand in :func:`build_sample`, never emitted by ``encode``.
     """
     from transformers import AutoTokenizer
     return AutoTokenizer.from_pretrained(repo)
@@ -227,17 +234,19 @@ def build_sample(img: Image.Image, text: str, tokenizer, cfg: Config, augment: b
     }
 
 
-def build_attn_mask(token_type: torch.Tensor) -> torch.Tensor:
+def build_attn_mask(token_type: torch.Tensor, bidirectional_img: bool = True) -> torch.Tensor:
     """Build the boolean self-attention mask from per-token type codes.
 
-    Encodes the prefix-LM masking scheme: the image is a fully-observed prefix
-    (bidirectional), while text is generated causally.
+    Encodes the prefix-LM masking scheme: the image is a fully-observed prefix,
+    while text is generated causally.
 
     Rules (query i attending to key j):
         - Keys that are pad (PAD_IMG or SEQ_PAD) are never attended to.
-        - Image queries (real or pad) attend bidirectionally to the real prefix
-          (BOS + real image patches) only -- never to text, so no labels leak
-          backward into the image.
+        - Image queries (real or pad) attend to the real prefix (BOS + real image
+          patches) only -- never to text, so no labels leak backward into the
+          image. When ``bidirectional_img`` is True they attend to the whole prefix
+          in both directions; when False they attend causally (BOS + earlier/equal
+          real patches only), like text.
         - Text queries attend causally to all real tokens (BOS + real image +
           earlier/equal text).
         - SEQ_PAD queries attend to themselves only, which keeps every query row
@@ -246,6 +255,8 @@ def build_attn_mask(token_type: torch.Tensor) -> torch.Tensor:
     Args:
         token_type: Per-token type codes, shape [B, S] (values TEXT/REAL_IMG/
             PAD_IMG/SEQ_PAD).
+        bidirectional_img: If True (default), image patches see the full image
+            prefix bidirectionally; if False, they are causal over the prefix.
 
     Returns:
         A boolean mask of shape [B, 1, S, S] where True = attend.
@@ -263,7 +274,10 @@ def build_attn_mask(token_type: torch.Tensor) -> torch.Tensor:
     key_prefix = prefix_key[:, None, :]                              # [B,1,S]
 
     text_allowed = key_real & causal                                 # [B,S,S]
-    image_allowed = key_prefix.expand(B, S, S)                       # [B,S,S]
+    if bidirectional_img:
+        image_allowed = key_prefix.expand(B, S, S)                   # [B,S,S] full prefix, both ways
+    else:
+        image_allowed = key_prefix & causal                         # [B,S,S] BOS + earlier/equal real
     self_only = (idx[:, None] == idx[None, :])[None].expand(B, S, S) # [B,S,S]
 
     q_img = ((token_type == REAL_IMG) | (token_type == PAD_IMG))[:, :, None]
@@ -275,6 +289,55 @@ def build_attn_mask(token_type: torch.Tensor) -> torch.Tensor:
     allowed = torch.where(q_img, image_allowed, allowed)
     allowed = torch.where(q_pad, self_only, allowed)
     return allowed[:, None, :, :]
+
+
+def image_mask_mod(token_type: torch.Tensor, bidirectional_img: bool = True):
+    """Return a FlexAttention ``mask_mod`` mirroring :func:`build_attn_mask`.
+
+    The returned closure maps ``(b, h, q_idx, kv_idx) -> bool`` (True = attend),
+    encoding the same prefix-LM scheme as the dense builder so the two backends are
+    interchangeable. It indexes ``token_type`` directly, so that tensor must live on
+    the device the BlockMask is built for. Heads are ignored (the mask is
+    head-independent).
+    """
+    def mask_mod(b, h, q_idx, kv_idx):
+        qt = token_type[b, q_idx]
+        kt = token_type[b, kv_idx]
+        key_real = (kt == TEXT) | (kt == REAL_IMG)               # valid (non-pad) keys
+        key_prefix = (kt == REAL_IMG) | (kv_idx == 0)            # BOS + real img patches
+        causal = q_idx >= kv_idx
+        image_allowed = key_prefix if bidirectional_img else (key_prefix & causal)
+        q_img = (qt == REAL_IMG) | (qt == PAD_IMG)
+        return ((qt == TEXT) & key_real & causal) \
+            | (q_img & image_allowed) \
+            | ((qt == SEQ_PAD) & (q_idx == kv_idx))             # seq-pad: self only
+    return mask_mod
+
+
+def build_block_mask(token_type: torch.Tensor, bidirectional_img: bool):
+    """Build a FlexAttention ``BlockMask`` from per-token type codes.
+
+    Same masking semantics as :func:`build_attn_mask`, but as a block-sparse mask the
+    fused kernel can skip (e.g. the all-pad blocks). ``H=None`` broadcasts over heads.
+    Built once per batch on ``token_type``'s device; with static shapes (collate pads
+    to ``cfg.max_seq_len`` on the flex path) it does not trigger trunk recompiles.
+    """
+    B, S = token_type.shape
+    return create_block_mask(image_mask_mod(token_type, bidirectional_img),
+                             B, None, S, S, device=token_type.device)
+
+
+def resolve_attn_mask(token_type: torch.Tensor, cfg: Config):
+    """Build the per-batch attention mask object for the configured backend.
+
+    Returns a FlexAttention ``BlockMask`` on the flex+CUDA path, else the dense
+    ``[B,1,S,S]`` bool tensor -- the universal fallback used on CPU, in tests, and
+    whenever flex/CUDA is unavailable. ``token_type`` must already be on the compute
+    device.
+    """
+    if cfg.attn_impl == "flex" and _FLEX_AVAILABLE and token_type.device.type == "cuda":
+        return build_block_mask(token_type, cfg.bidirectional_img)
+    return build_attn_mask(token_type, cfg.bidirectional_img)
 
 
 def collate_fn(batch, cfg: Config):
@@ -296,7 +359,10 @@ def collate_fn(batch, cfg: Config):
         [B,S], and ``token_type`` [B,S].
     """
     B = len(batch)
-    S = max(s["input_ids"].shape[0] for s in batch)
+    # The flex path pads to a fixed max_seq_len so the compiled trunk keeps static
+    # shapes (build_sample already truncates samples to <= max_seq_len); the dense path
+    # pads to the batch max to keep CPU/test forwards cheap.
+    S = cfg.max_seq_len if cfg.attn_impl == "flex" else max(s["input_ids"].shape[0] for s in batch)
     P = max(s["patches"].shape[0] for s in batch)
 
     input_ids = torch.zeros(B, S, dtype=torch.long)
@@ -321,7 +387,9 @@ def collate_fn(batch, cfg: Config):
         patch_pos[b, :p] = s["patch_pos"]
 
     image_slots = (token_type == REAL_IMG) | (token_type == PAD_IMG)
-    attn_mask = build_attn_mask(token_type)
+    # On the flex path the BlockMask is built on-device at the step boundary
+    # (see data.resolve_attn_mask); collate leaves it None.
+    attn_mask = None if cfg.attn_impl == "flex" else build_attn_mask(token_type, cfg.bidirectional_img)
     return {
         "input_ids": input_ids,
         "patches": patches,

@@ -105,6 +105,14 @@ uv run python inference.py --ckpt checkpoints/final.pt --image page.png
 uv run python -m pytest -q
 ```
 
+### Environment variables
+
+- `WANDB_API_KEY` — when set (and `use_wandb` is on), W&B authenticates from it,
+  so headless/CI runs need no prior `wandb login`.
+- `HF_TOKEN` — when set **and** `Config.hf_repo` names a repo, the best checkpoint
+  (`best.pt`) is pushed to that HuggingFace Hub repo (created **private**) at the
+  end of training. Unset token = no upload.
+
 All run settings live in `config.py`: `dataset`, `epochs`, `batch_size`
 (micro-batch), `grad_accum` (**effective batch = batch_size × grad_accum**, default
 8 × 8 = 64), `base_repo` / `lr_mult_pretrained` (base-model initialization; the

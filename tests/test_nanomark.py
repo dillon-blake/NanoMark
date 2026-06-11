@@ -15,7 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))                  
 
 from config import Config
 from data import (PAD_IMG, REAL_IMG, SEQ_PAD, TEXT, OCRDataset, build_attn_mask,
-                  build_sample, collate_fn, get_tokenizer, preprocess_image)
+                  build_sample, collate_fn, get_tokenizer, image_mask_mod,
+                  preprocess_image)
 from model import NanoMark, apply_rope, build_rope_cache, is_vision_adapter
 from synthetic import render
 from train import build_optimizer
@@ -26,11 +27,12 @@ def small_cfg(**kw):
 
     Passes the model shape explicitly (the real pipeline reads it from the base
     model via ``Config.from_base``; tests build a tiny model with no base). The
-    vocab matches the Qwen3 tokenizer the tests tokenize with.
+    vocab matches the Granite-4.0 tokenizer the tests tokenize with. The muP
+    multipliers are left at their neutral defaults (this tiny model has no base).
     """
     base = dict(d_model=32, n_heads=4, n_kv_heads=2, head_dim=8, mlp_hidden=64,
                 n_layers=2, patch_size=8, max_image_px=64, rope_base=1000000.0,
-                vocab_size=151936, padded_vocab=151936)
+                vocab_size=100352, padded_vocab=100352)
     base.update(kw)
     return Config(**base)
 
@@ -68,6 +70,42 @@ def test_attn_mask_matrix():
     for i, allowed in expected.items():
         got = set(torch.nonzero(mask[i]).flatten().tolist())
         assert got == allowed, f"row {i}: got {got}, want {allowed}"
+
+
+def test_attn_mask_causal_image():
+    # same fixture as test_attn_mask_matrix, but image patches are causal over the
+    # prefix (bidirectional_img=False): each image query sees BOS + earlier/equal
+    # real patches only. Text rows are unchanged.
+    tt = torch.tensor([[TEXT, REAL_IMG, PAD_IMG, REAL_IMG, PAD_IMG, TEXT, TEXT, TEXT]])
+    mask = build_attn_mask(tt, bidirectional_img=False)[0, 0]  # [S, S] bool
+    expected = {
+        0: {0},                  # BOS: causal, only itself
+        1: {0, 1},               # real img @1: BOS + itself (no forward to patch @3)
+        2: {0, 1},               # pad img @2: BOS + real patch @1 (causal)
+        3: {0, 1, 3},            # real img @3: BOS + real patches @1,@3
+        4: {0, 1, 3},            # pad img @4: BOS + real patches @1,@3
+        5: {0, 1, 3, 5},         # SOC text: real prefix + causal text (unchanged)
+        6: {0, 1, 3, 5, 6},
+        7: {0, 1, 3, 5, 6, 7},
+    }
+    for i, allowed in expected.items():
+        got = set(torch.nonzero(mask[i]).flatten().tolist())
+        assert got == allowed, f"row {i}: got {got}, want {allowed}"
+
+
+def test_mask_mod_matches_dense():
+    # The FlexAttention mask_mod must encode exactly the same prefix-LM scheme as the
+    # dense build_attn_mask, for both image-attention modes. Materialize the mask_mod
+    # over every (q, kv) pair via broadcast indexing (no flex/CUDA needed) and compare.
+    tt = torch.tensor([[TEXT, REAL_IMG, PAD_IMG, REAL_IMG, PAD_IMG, TEXT, TEXT, TEXT]])
+    S = tt.shape[1]
+    b = torch.zeros(S, S, dtype=torch.long)                 # single batch row
+    qi = torch.arange(S)[:, None].expand(S, S)
+    ki = torch.arange(S)[None, :].expand(S, S)
+    for flag in (True, False):
+        got = image_mask_mod(tt, bidirectional_img=flag)(b, None, qi, ki)  # [S, S] bool
+        expected = build_attn_mask(tt, bidirectional_img=flag)[0, 0]
+        assert torch.equal(got, expected), f"mask_mod != dense for bidirectional_img={flag}"
 
 
 def test_seqpad_query_has_self():
@@ -123,8 +161,7 @@ def test_bidirectional_image():
     torch.manual_seed(1)
     # non-uniform perturbation: changes the patch's direction. (A uniform add
     # would be cancelled by patch_norm, which is scale-invariant.) Scaled up so the
-    # forward-attention effect clears the tolerance even with QK-Norm damping the
-    # attention logits in this tiny random-init net.
+    # forward-attention effect clears the tolerance in this tiny random-init net.
     patches2[0, j_seq - 1] += 5.0 * torch.randn(cfg.patch_dim)  # patch array idx = seq pos - 1 (BOS at 0)
     out2 = model(b["input_ids"], patches2, b["image_slots"], b["pos_h"], b["pos_w"], b["attn_mask"])
 
@@ -436,7 +473,7 @@ def test_collate_patch_pos_padding():
 
 def test_learned_table_is_fresh_vision_adapter():
     # the learned table must be recognized as a from-scratch vision-adapter param
-    # so the Qwen loader leaves it random and the optimizer gives it the full LR.
+    # so the Granite loader leaves it random and the optimizer gives it the full LR.
     cfg = small_cfg(image_pos_mode="learned")
     model = NanoMark(cfg)
     assert is_vision_adapter("patch_pos_emb")

@@ -68,9 +68,9 @@ def transcribe(model, img, cfg, tokenizer, device, max_new_tokens=256, temperatu
         pos_h.append(offset)  # SOC
         pos_w.append(offset)
 
-    # only real tokens and EOS are valid outputs. Unlike GPT-2, the Qwen3 special
-    # tokens live *inside* the vocab range, so forbid BOS/SOC explicitly (and the
-    # unused vocab-padding rows); EOS stays allowed.
+    # only real tokens and EOS are valid outputs. The Granite structural tokens
+    # live *inside* the vocab range, so forbid BOS/SOC explicitly (and the unused
+    # vocab-padding rows); EOS stays allowed.
     valid = torch.zeros(cfg.padded_vocab, device=device)
     valid[cfg.vocab_size:] = float("-inf")
     valid[cfg.bos_id] = float("-inf")
@@ -85,7 +85,7 @@ def transcribe(model, img, cfg, tokenizer, device, max_new_tokens=256, temperatu
             (tt == REAL_IMG) | (tt == PAD_IMG),
             torch.tensor([pos_h], device=device),
             torch.tensor([pos_w], device=device),
-            build_attn_mask(tt),
+            build_attn_mask(tt, cfg.bidirectional_img),
             patch_pos,
         )
         next_logits = logits[0, -1] + valid
